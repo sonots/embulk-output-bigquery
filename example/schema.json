@@ -1,0 +1,30 @@
+[
+  {
+    "name":"timestamp",
+    "type":"TIMESTAMP"
+  },
+  {
+    "name":"string_date",
+    "type":"STRING"
+  },
+  {
+    "name":"foo",
+    "type":"STRING"
+  },
+  {
+    "name":"bar",
+    "type":"STRING"
+  },
+  {
+    "name":"id",
+    "type":"INTEGER"
+  },
+  {
+    "name":"name",
+    "type":"STRING"
+  },
+  {
+    "name":"score",
+    "type":"FLOAT"
+  }
+]

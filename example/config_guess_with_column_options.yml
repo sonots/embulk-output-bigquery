@@ -1,0 +1,37 @@
+# embulk gem install embulk-parser-jsonl
+in:
+  type: file
+  path_prefix: example/nested_example.jsonl
+  parser:
+    type: jsonl
+    columns:
+      - {name: timestamp,   type: timestamp, format: "%Y-%m-%d %H:%M:%S.%N", timezone: "+09:00"}
+      - {name: string_date, type: string}
+      - {name: foo,         type: string}
+      - {name: bar,         type: string}
+      - {name: id,          type: long}
+      - {name: name,        type: string}
+      - {name: score,       type: double}
+      - {name: json,        type: json}
+out:
+  type: bigquery
+  mode: replace
+  auth_method: json_key
+  json_keyfile: /tmp/your-project-000.json
+  dataset: your_dataset_name
+  table: your_table_name_%Y%m%d
+  compression: GZIP
+  source_format: NEWLINE_DELIMITED_JSON
+  auto_create_table: true
+  column_options:
+    - {name: timestamp,   type: STRING, timestamp_format: "%Y-%m-%d", timezone: "+09:00"}
+    - {name: string_date, type: TIMESTAMP, timestamp_format: "%Y-%m-%d", timezone: "+09:00"}
+    - {name: id,          type: STRING}
+    - {name: score,       type: STRING}
+    - name: json
+      type: RECORD
+      fields:
+        - {name: k1,      type: STRING}
+        - {name: k2,      type: STRING}
+# 2015-07-13
+# 2015-07-12 15:00:00
