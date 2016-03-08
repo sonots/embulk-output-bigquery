@@ -56,6 +56,8 @@ module Embulk
           'default_timestamp_format'       => config.param('default_timestamp_format',       :string,  :default => ValueConverterFactory::DEFAULT_TIMESTAMP_FORMAT),
           'payload_column'                 => config.param('payload_column',                 :string,  :default => nil),
           'payload_column_index'           => config.param('payload_column_index',           :integer, :default => nil),
+          'time_column'                    => config.param('time_column',                    :string,  :default => nil),
+          'time_column_index'              => config.param('time_column_index',              :integer, :default => nil),
           
           'timeout_sec'                    => config.param('timeout_sec',                    :integer, :default => 300),
           'open_timeout_sec'               => config.param('open_timeout_sec',               :integer, :default => 300),
@@ -95,13 +97,6 @@ module Embulk
           end
           task['dataset_old'] ||= task['dataset']
           task['table_old']   ||= task['table']
-        end
-
-        if task['table_old']
-          task['table_old'] = now.strftime(task['table_old'])
-        end
-        if task['table']
-          task['table'] = now.strftime(task['table'])
         end
 
         task['auth_method'] = task['auth_method'].downcase
@@ -148,6 +143,17 @@ module Embulk
           end
         end
 
+        if task['time_column_index']
+          if task['time_column_index'] < 0 || schema.size <= task['time_column_index']
+            raise ConfigError.new "time_column_index #{task['time_column_index']} is out of schema size"
+          end
+        elsif task['time_column']
+          task['time_column_index'] = schema.find_index {|c| c[:name] == task['time_column'] }
+          if task['time_column_index'].nil?
+            raise ConfigError.new "time_column #{task['time_column']} does not exist in schema"
+          end
+        end
+
         if task['schema_file']
           unless File.exist?(task['schema_file'])
             raise ConfigError.new "schema_file #{task['schema_file']} is not found"
@@ -188,6 +194,15 @@ module Embulk
             file_ext << '.gz'
           end
           task['file_ext'] = file_ext
+        end
+
+        unless task['time_column_index']
+          if task['table_old']
+            task['table_old'] = now.strftime(task['table_old'])
+          end
+          if task['table']
+            task['table'] = now.strftime(task['table'])
+          end
         end
 
         unique_name = "%08x%08x%08x" % [Process.pid, now.tv_sec, now.tv_nsec]
@@ -252,18 +267,8 @@ module Embulk
           end
         end
 
-        case task['mode']
-        when 'delete_in_advance'
-          bigquery.delete_table(task['table'])
-          bigquery.create_table(task['table'])
-        when 'replace', 'replace_backup'
-          bigquery.create_table(task['temp_table'])
-        else # append
-          if task['auto_create_table']
-            bigquery.create_table(task['table'])
-          else
-            bigquery.get_table(task['table']) # raises NotFoundError
-          end
+        unless @task['time_column_index']
+          create_table
         end
 
         begin
@@ -321,6 +326,23 @@ module Embulk
         next_config_diff = {}
         return next_config_diff
       end
+
+      def self.create_table(table)
+        case task['mode']
+        when 'delete_in_advance'
+          bigquery.delete_table(task['table'])
+          bigquery.create_table(task['table'])
+        when 'replace', 'replace_backup'
+          bigquery.create_table(task['temp_table'])
+        else # append
+          if task['auto_create_table']
+            bigquery.create_table(task['table'])
+          else
+            bigquery.get_table(task['table']) # raises NotFoundError
+          end
+        end
+
+
 
       # instance is created on each thread
       def initialize(task, schema, index)
