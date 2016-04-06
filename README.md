@@ -50,6 +50,7 @@ OAuth flow for installed applications.
 |  default_timestamp_format            | string      | optional   | %Y-%m-%d %H:%M:%S.%6N    | |
 |  payload_column                      | string      | optional   | nil                      | [See below](#formatter-performance-issue) |
 |  payload_column_index                | integer     | optional   | nil                      | [See below](#formatter-performance-issue) |
+|  preferred_max_loads                 | integer     | optional   | nil                      | Preferred maximum number of Load jobs. (Local Executor) As default, this plugin would generate `max_threads` number of local files, and load them. BigQuery has a quota that one project can issue 10,000 jobs per day. This option concatenates local files to be `preferred_max_loads` to suppress number of load jobs. If a file size exceeds the maximum file size quota of BigQuery (4GB for gzip file), the number of concatenated files would exceed `preferred_max_loads`. This is why the parameter name is `preferred`. |
 
 Client or request options
 

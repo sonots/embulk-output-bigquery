@@ -38,7 +38,9 @@ else
             'open_timeout_sec' => 300,
             'job_status_max_polling_time' => 3600,
             'job_status_polling_interval' => 10,
-            'source_format'    => 'CSV'
+            'source_format'    => 'CSV',
+            'path_prefix'      => 'tmp/a',
+            'compression'      => 'GZIP',
           }
         end
 
@@ -160,6 +162,59 @@ else
             client.create_table('your_table_name')
             File.write("tmp/your_file_name.csv", record.to_csv)
             assert_nothing_raised { client.load("/tmp/your_file_name.csv", 'your_table_name') }
+          end
+        end
+
+        sub_test_case "cat_file" do
+          def setup
+            @from_files = %w[tmp/from_file1.csv tmp/from_file2.csv]
+            @from_files.each {|file| File.write(file, record.to_csv) }
+            @to_file = 'tmp/to_file.csv'
+          end
+
+          def teardown
+            (@from_files + [@to_file]).each{|file| File.unlink(file) rescue nil }
+          end
+
+          def test_cat_file
+            @from_files.each do |from_file|
+              client.send('cat_file', from_file, @to_file)
+            end
+            to_content = File.read(@to_file)
+            from_content = @from_files.map {|file| File.read(file) }.join('')
+            assert { to_content == from_content }
+          end
+        end
+
+        sub_test_case "cat_files" do
+          def setup
+            @from_files = %w[
+              tmp/from_file1.csv
+              tmp/from_file2.csv
+              tmp/from_file3.csv
+              tmp/from_file4.csv
+              tmp/from_file5.csv
+            ]
+            @from_files.each {|file| File.write(file, record.to_csv) }
+            @to_file = 'tmp/to_file.csv'
+          end
+
+          def teardown
+            (@from_files + [@to_file]).each{|file| File.unlink(file) rescue nil }
+          end
+
+          def test_cat_files
+            file_map = client.send('cat_files', @from_files, 2)
+            groups = file_map.group_by {|from_file, to_file| to_file }
+            assert { groups.size == 2 }
+            assert { groups.values[0].size == 3 }
+            assert { groups.values[1].size == 2 }
+            groups.each do |to_file, file_map_in_group|
+              from_files = file_map_in_group.map(&:first)
+              to_content = File.read(to_file)
+              from_content = from_files.map {|file| File.read(file) }.join('')
+              assert { to_content == from_content }
+            end
           end
         end
       end

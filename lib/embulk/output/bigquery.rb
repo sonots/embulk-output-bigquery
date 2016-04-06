@@ -44,6 +44,7 @@ module Embulk
           'auto_create_table'              => config.param('auto_create_table',              :bool,    :default => false),
           'schema_file'                    => config.param('schema_file',                    :string,  :default => nil),
           'template_table'                 => config.param('template_table',                 :string,  :default => nil),
+
           'delete_from_local_when_job_end' => config.param('delete_from_local_when_job_end', :bool,    :default => true),
           'job_status_max_polling_time'    => config.param('job_status_max_polling_time',    :integer, :default => 3600),
           'job_status_polling_interval'    => config.param('job_status_polling_interval',    :integer, :default => 10),
@@ -51,13 +52,14 @@ module Embulk
           'prevent_duplicate_insert'       => config.param('prevent_duplicate_insert',       :bool,    :default => false),
           'with_rehearsal'                 => config.param('with_rehearsal',                 :bool,    :default => false),
           'rehearsal_counts'               => config.param('rehearsal_counts',               :integer, :default => 1000),
+          'preferred_max_loads'            => config.param('preferred_max_loads',            :integer, :default => nil),
 
           'column_options'                 => config.param('column_options',                 :array,   :default => []),
           'default_timezone'               => config.param('default_timezone',               :string,  :default => ValueConverterFactory::DEFAULT_TIMEZONE),
           'default_timestamp_format'       => config.param('default_timestamp_format',       :string,  :default => ValueConverterFactory::DEFAULT_TIMESTAMP_FORMAT),
           'payload_column'                 => config.param('payload_column',                 :string,  :default => nil),
           'payload_column_index'           => config.param('payload_column_index',           :integer, :default => nil),
-          
+
           'timeout_sec'                    => config.param('timeout_sec',                    :integer, :default => 300),
           'open_timeout_sec'               => config.param('open_timeout_sec',               :integer, :default => 300),
           'retries'                        => config.param('retries',                        :integer, :default => 5),

@@ -102,31 +102,108 @@ module Embulk
           # You may think as, load job is a background job, so sending requests in parallel
           # does not improve performance. However, with actual experiments, this parallel
           # loadings drastically shortened waiting time. It looks one jobs.insert takes about 50 sec.
+          #
           # NOTICE: parallel uploadings of files consumes network traffic. With 24 concurrencies
           # with 100MB files consumed about 500Mbps in the experimented environment at a peak.
           #
-          # We before had a `max_load_parallels` option, but this was not extensible for map reduce executor
-          # So, we dropped it. See https://github.com/embulk/embulk-output-bigquery/pull/35
-          max_load_parallels = paths.size # @task['max_load_parallels'] || paths.size
-          responses = []
-          paths.each_with_index.each_slice(max_load_parallels) do |paths_group|
-            Embulk.logger.debug { "embulk-output-bigquery: LOAD IN PARALLEL #{paths_group}" }
-            threads = []
-            paths_group.each do |path, idx|
-              threads << Thread.new do
-                # I am not sure whether google-api-ruby-client is thread-safe,
-                # so let me create new instances for each thread for safe
-                bigquery = self.class.new(@task, @schema, fields)
-                response = bigquery.load(path, table)
-                [idx, response]
-              end
-            end
-            ThreadsWait.all_waits(*threads) do |th|
-              idx, response = th.value # raise errors occurred in threads
-              responses[idx] = response
+          # Futheremore, BQ has a quota that one project can issue 10,000 jobs per day.
+          # Configure `preferred_max_loads` option to suppress number of jobs issued
+
+          max_loads = @task['preferred_max_loads'] || paths.size
+          if max_loads >= paths.size
+            cat_paths = paths
+          else
+            cat_paths = cat_files(paths, max_loads).values.uniq
+          end
+
+          Embulk.logger.debug { "embulk-output-bigquery: LOAD IN PARALLEL #{cat_paths}" }
+          threads = []
+          cat_paths.each_with_index do |path, idx|
+            threads << Thread.new do
+              # I am not sure whether google-api-ruby-client is thread-safe,
+              # so let me create new instances for each thread for safe
+              bigquery = self.class.new(@task, @schema, fields)
+              response = bigquery.load(path, table)
+              [idx, response]
             end
           end
+          responses = []
+          ThreadsWait.all_waits(*threads) do |th|
+            idx, response = th.value # raise errors occurred in threads
+            responses[idx] = response
+          end
           responses
+        ensure
+          if cat_paths != paths
+            cat_paths.each do |path|
+              Embulk.logger.info { "embulk-output-bigquery: delete #{path}" }
+              File.unlink(path) rescue nil
+            end
+          end
+        end
+
+        COMPRESSED_MAX_SIZE = 4 * 1024 * 1024 * 1204 # 4G
+        UNCOMPRESSED_MAX_SIZE = 5 * 1024 * 1024 * 1024 * 1024 # 5TB
+
+        private def max_size
+          @max_size ||=
+            @task['compression'].downcase == 'gzip' ?
+            COMPRESSED_MAX_SIZE : UNCOMPRESSED_MAX_SIZE
+        end
+
+        # Concatenate paths into `num_files` files
+        #
+        # BigQuery Load api supports multiple file uploads only for **GCS** yet,
+        # We need to concatenate local files by ourselves...
+        #
+        # @return [Hash] from_file => to_file
+        private def cat_files(files, num_files)
+          cat_map = get_cat_map(files, num_files)
+          outbuf = String.new
+          cat_map.each do |from_file, to_file|
+            cat_file(from_file, to_file, outbuf)
+          end
+          cat_map
+        end
+
+        private def cat_file(from_file, to_file, outbuf = String.new)
+          Embulk.logger.info { "embulk-output-bigquery: cat #{from_file} >> #{to_file}" }
+          File.open(to_file, 'ab') do |to_fp|
+            File.open(from_file, 'rb') do |from_fp|
+              while from_fp.read(4096, outbuf)
+                to_fp << outbuf
+              end
+            end
+          end
+        end
+
+        # @return [Hash] from_file => to_file
+        private def get_cat_map(files, num_files)
+          num_in_group = (files.size / num_files.to_f).ceil
+
+          idx_in_group = 0
+          sum_size_in_group = 0
+          to_idx = 0
+
+          files.map.with_index do |file, from_idx|
+            sum_size_in_group += File.stat(file).size
+            idx_in_group += 1
+
+            if (sum_size_in_group >= max_size) || (idx_in_group > num_in_group)
+              idx_in_group = 0
+              sum_size_in_group = 0
+              to_idx += 1
+            end
+
+            [file, to_idx]
+          end.map do |file, to_idx|
+            to_file = sprintf(
+              "#{@task['path_prefix']}#{@task['sequence_format']}#{@task['file_ext']}" \
+              ".cat.#{to_idx}",
+              Process.pid, Thread.current.object_id
+            )
+            [file, to_file]
+          end.to_h
         end
 
         def load(path, table)
