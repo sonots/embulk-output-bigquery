@@ -13,10 +13,6 @@ module Embulk
           @index = index
           @converters = converters || ValueConverterFactory.create_converters(task, schema)
 
-          @num_input_rows = 0
-          @progress_log_timer = Time.now
-          @previous_num_input_rows = 0
-
           if @task['payload_column_index']
             @payload_column_index = @task['payload_column_index']
             @formatter_proc = self.method(:to_payload)
@@ -118,12 +114,9 @@ module Embulk
           "#{hash.to_json}\n"
         end
 
-        def num_format(number)
-          number.to_s.gsub(/(\d)(?=(\d{3})+(?!\d))/, '\1,')
-        end
-
         def add(page)
           io = thread_io
+          num_rows = 0
           # I once tried to split IO writing into another IO thread using SizedQueue
           # However, it resulted in worse performance, so I removed the codes.
           page.each do |record|
@@ -131,21 +124,10 @@ module Embulk
             formatted_record = @formatter_proc.call(record)
             Embulk.logger.trace { "embulk-output-bigquery: formatted_record #{formatted_record.chomp}" }
             io.write formatted_record
-            @num_input_rows += 1
+            num_rows += 1
           end
-          now = Time.now
-          if @progress_log_timer < now - 10 # once in 10 seconds
-            speed = ((@num_input_rows - @previous_num_input_rows) / (now - @progress_log_timer).to_f).round(1)
-            @progress_log_timer = now
-            @previous_num_input_rows = @num_input_rows
-            Embulk.logger.info { "embulk-output-bigquery: num_input_rows #{num_format(@num_input_rows)} (#{num_format(speed)} rows/sec)" }
-          end
-        end
-
-        def commit
-          task_report = {
-            'num_input_rows' => @num_input_rows,
-          }
+          @num_input_rows += num_rows
+          num_rows
         end
       end
     end

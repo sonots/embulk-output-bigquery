@@ -339,13 +339,37 @@ module Embulk
         return next_config_diff
       end
 
+      def self.instances
+        @instances ||= []
+      end
+
+      def self.num_format(number)
+        number.to_s.gsub(/(\d)(?=(\d{3})+(?!\d))/, '\1,')
+      end
+
+      @num_input_rows = 0
+      @progress_log_timer = Time.now
+      @previous_num_input_rows = 0
+
+      def self.log_progress
+        now = Time.now
+        if @progress_log_timer < now - 10 # once in 10 seconds
+          speed = ((@num_input_rows - @previous_num_input_rows) / (now - @progress_log_timer).to_f).round(1)
+          @progress_log_timer = now
+          @previous_num_input_rows = @num_input_rows
+          Embulk.logger.info { "embulk-output-bigquery: num_input_rows #{num_format(@num_input_rows)} (#{num_format(speed)} rows/sec)" }
+        end
+      end
+
       # instance is created on each task
       def initialize(task, schema, index)
         super
 
+        self.class.instances << self
+        @num_input_rows = 0
+
         if task['with_rehearsal'] and @index == 0
           @rehearsaled = false
-          @num_rows = 0
         end
 
         unless task['skip_file_generation']
@@ -360,16 +384,15 @@ module Embulk
       # called for each page in each task
       def add(page)
         if task['with_rehearsal'] and @index == 0 and !@rehearsaled
-          page = page.to_a # to avoid https://github.com/embulk/embulk/issues/403
-          if @num_rows >= task['rehearsal_counts']
+          if @num_input_rows >= task['rehearsal_counts']
             load_rehearsal
             @rehearsaled = true
           end
-          @num_rows += page.to_a.size
         end
 
         unless task['skip_file_generation']
-          @file_writer.add(page)
+          @num_input_rows += @file_writer.add(page)
+          self.class.log_progress if @index == 0
         end
       end
 
@@ -406,7 +429,9 @@ module Embulk
       # called after processing all pages in each task, returns a task_report
       def commit
         unless task['skip_file_generation']
-          @file_writer.commit
+          task_report = {
+            'num_input_rows' => @num_input_rows,
+          }
         else
           {}
         end
