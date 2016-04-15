@@ -116,12 +116,16 @@ module Embulk
               # so let me create new instances for each thread for safe
               bigquery = self.class.new(@task, @schema, fields)
               response = bigquery.load(path, table)
-              [idx, response]
+              [idx, path, response]
             end
           end
           ThreadsWait.all_waits(*threads) do |th|
-            idx, response = th.value # raise errors occurred in threads
-            responses[idx] = response
+            idx, path, response = th.value # raise errors occurred in threads
+            if idx == nil
+              Embulk.logger.error "idx is nil by some reasons. path = #{path}, response = #{response.to_h}"
+            else
+              responses[idx] = response
+            end
           end
           responses
         end
