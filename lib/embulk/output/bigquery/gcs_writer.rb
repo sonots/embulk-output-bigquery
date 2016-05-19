@@ -1,3 +1,5 @@
+require 'google/apis/storage_v1'
+require 'google/api_client/auth/key_utils'
 require 'zlib'
 require 'json'
 require 'csv'
@@ -17,43 +19,36 @@ module Embulk
           @json_key = task['json_keyfile']
 
           @project = task['project']
-          @bucket = task['bucket']
+          @bucket = task['gcs_bucket']
 
-          create_or_patch_lifecyle_bucket
+          insert_or_patch_lifecycle_bucket
           purge_objects(task['path_prefix'])
         end
 
-        def open
+        def lazy_initialize
+          return nil if @lazy_initialized
           @z = Zlib::Deflate.new
-          @r, @w = IO.pipe
+          @io_r, @io_w = IO.pipe
           @path = sprintf(
             "#{@task['path_prefix']}#{@task['sequence_format']}#{@task['file_ext']}",
             Process.pid, Thread.current.object_id
           )
-          insert_object(path: @path, io: @r)
-          @opened = true
+          insert_object(@path, @io_r)
+          @lazy_initialized = true
         end
 
         def close
-          @w << @z.finish
-          @w.close rescue nil
-          "gs://#{@bucket}/#{@path}"
-        end
-
-        def write(io, formatted_record)
-          io.write @z.deflate(formatted_record)
+          @io_w << @z.finish
+          @io_w.close rescue nil
         end
 
         def add(page)
-          open unless @opened
-          _io = @io
-          # I once tried to split IO writing into another IO thread using SizedQueue
-          # However, it resulted in worse performance, so I removed the codes.
+          lazy_initialize unless @lazy_initialized
           page.each do |record|
             Embulk.logger.trace { "embulk-output-bigquery: record #{record}" }
             formatted_record = @formatter_proc.call(record)
             Embulk.logger.trace { "embulk-output-bigquery: formatted_record #{formatted_record.chomp}" }
-            write(_io, formatted_record)
+            @io_w << @z.deflate(formatted_record)
             @num_rows += 1
           end
           log_num_rows
@@ -68,12 +63,12 @@ module Embulk
           client.request_options.retries = @task['retries']
           client.request_options.timeout_sec = @task['timeout_sec']
           client.request_options.open_timeout_sec = @task['open_timeout_sec']
-          logger.debug { "embulk-output-bigquery: gcs client_options: #{client.client_options.to_h}" }
-          logger.debug { "embulk-output-bigquery: gcs request_options: #{client.request_options.to_h}" }
+          Embulk.logger.debug { "embulk-output-bigquery: gcs client_options: #{client.client_options.to_h}" }
+          Embulk.logger.debug { "embulk-output-bigquery: gcs request_options: #{client.request_options.to_h}" }
 
           scope = "https://www.googleapis.com/auth/cloud-platform"
 
-          case task['auth_method']
+          case @auth_method
           when 'private_key'
             key = Google::APIClient::KeyUtils.load_from_pkcs12(@private_key_path, @private_key_passphrase)
             auth = Signet::OAuth2::Client.new(
@@ -121,7 +116,7 @@ module Embulk
             Embulk.logger.debug { "embulk-output-bigquery, insert_bucket(#{@project}, #{body}, #{opts})" }
             client.insert_bucket(@project, body, opts)
           rescue Google::Apis::ServerError, Google::Apis::ClientError, Google::Apis::AuthorizationError => e
-            if e.status_code == 409 && /Already Exists:/ =~ e.message
+            if e.status_code == 409 && /conflict:/ =~ e.message
               # ignore 'Already Exists' error
               return nil
             end
@@ -129,11 +124,11 @@ module Embulk
             Embulk.logger.error {
               "embulk-output-bigquery: insert_bucket(#{@project}, #{body}, #{opts}), response:#{response}"
             }
-            raise Error, "failed to create bucket #{@project}:#{dataset}, response:#{response}"
+            raise Error, "failed to create bucket #{@project}:#{bucket}, response:#{response}"
           end
         end
 
-        def get_bucket(bucket: nil)
+        def get_bucket(bucket = nil)
           bucket ||= @bucket
           begin
             opts = {}
@@ -171,14 +166,14 @@ module Embulk
           insert_response = insert_bucket(bucket)
           get_response = get_bucket(bucket)
           # apply lifecycle with patch method so that lifecycle is applied even if a bucket already exists
-          if get_response.nil? || (get_response.lifecycle.nil? && @task['bucket_lifecycle_ttl_days'])
+          if get_response.nil? || (get_response.lifecycle.nil? && @task['gcs_bucket_lifecycle_ttl_days'])
             patch_body = {
               lifecycle: {
                 rule:
                 [
                   {
                     action: {type: "Delete"},
-                    condition: {age: @task['bucket_lifecycle_ttl_days']}
+                    condition: {age: @task['gcs_bucket_lifecycle_ttl_days']}
                   }
                 ]
               }
@@ -189,32 +184,33 @@ module Embulk
           get_response
         end
 
-        def insert_object(bucket: nil, path:, io:)
+        def insert_object(path, io, bucket: nil)
           bucket ||= @bucket
+          gcs_path = "gs://#{File.join(bucket, path)}"
           begin
-            Embulk.logger.info { "embulk-output-bigquery: Create object... #{@project}:gs://#{bucket}/#{path}" }
-            body  = {
+            Embulk.logger.info { "embulk-output-bigquery: Create object... #{@project}:#{gcs_path}" }
+            body = {
               name: path,
-              upload_source: io,
-              content_type: 'application/gzip', # 'application/json'
             }
-            opts = {}
+            opts = {
+              upload_source: io,
+              content_type: 'application/json'
+            }
 
             Embulk.logger.debug { "embulk-output-bigquery, insert_object(#{bucket}, #{body}, #{opts})" }
-            client.insert_bucket(bucket, body, opts)
+            client.insert_object(bucket, body, opts)
           rescue Google::Apis::ServerError, Google::Apis::ClientError, Google::Apis::AuthorizationError => e
             response = {status_code: e.status_code, message: e.message, error_class: e.class}
             Embulk.logger.error {
               "embulk-output-bigquery: insert_object(#{bucket}, #{body}, #{opts}), response:#{response}"
             }
-            raise Error, "failed to create object #{bucket}:#{dataset}, response:#{response}"
+            raise Error, "failed to create object #{@project}:#{gcs_path}, response:#{response}"
           end
         end
 
-        def purge_objects(bucket: nil, path_prefix:)
+        def purge_objects(path_prefix, bucket: nil)
+          bucket ||= @bucket
         end
-
-
       end
     end
   end

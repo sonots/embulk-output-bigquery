@@ -43,14 +43,14 @@ module Embulk
           io
         end
 
+        def reopen
+          @io = open(io.path, 'a')
+        end
+
         def close
           Embulk.logger.debug { "close #{io.path}" }
           io.close rescue nil
           io
-        end
-
-        def reopen
-          @io = open(io.path, 'a')
         end
 
         def add(page)

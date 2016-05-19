@@ -68,10 +68,11 @@ module Embulk
           'application_name'               => config.param('application_name',               :string,  :default => 'Embulk BigQuery plugin'),
           'sdk_log_level'                  => config.param('sdk_log_level',                  :string,  :default => nil),
 
-          'gcs_bucket'                     => config.param('gcs_bucket',                     :string,  :default => nil), # upload to and load from gcs
           'path_prefix'                    => config.param('path_prefix',                    :string,  :default => nil),
           'sequence_format'                => config.param('sequence_format',                :string,  :default => '.%d.%d'),
           'file_ext'                       => config.param('file_ext',                       :string,  :default => nil),
+          'gcs_bucket'                     => config.param('gcs_bucket',                     :string,  :default => nil), # upload to and load from gcs
+          'gcs_bucket_lifecycle_ttl_days'  => config.param('gcs_bucket_lifecycle_ttl_days',  :string,  :default => nil),
           'skip_file_generation'           => config.param('skip_file_generation',           :bool,    :default => false),
           'compression'                    => config.param('compression',                    :string,  :default => 'NONE'),
 
