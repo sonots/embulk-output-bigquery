@@ -1,35 +1,15 @@
 require 'zlib'
 require 'json'
 require 'csv'
+require_relative 'abstract_writer'
 require_relative 'value_converter_factory'
 
 module Embulk
   module Output
     class Bigquery < OutputPlugin
-      class GcsWriter
-        attr_reader :num_rows
-
+      class GcsWriter < AbstractWriter
         def initialize(task, schema, index, converters = nil)
-          @task = task
-          @schema = schema
-          @index = index
-          @converters = converters || ValueConverterFactory.create_converters(task, schema)
-
-          @num_rows = 0
-          @progress_log_timer = Time.now
-          @previous_num_rows = 0
-
-          if @task['payload_column_index']
-            @payload_column_index = @task['payload_column_index']
-            @formatter_proc = self.method(:to_payload)
-          else
-            case @task['source_format'].downcase
-            when 'csv'
-              @formatter_proc = self.method(:to_csv)
-            else
-              @formatter_proc = self.method(:to_jsonl)
-            end
-          end
+          super(task, schema, index, converters)
 
           @auth_method = task['auth_method']
           @private_key_path = task['p12_keyfile']
@@ -38,6 +18,46 @@ module Embulk
 
           @project = task['project']
           @bucket = task['bucket']
+
+          create_or_patch_lifecyle_bucket
+          purge_objects(task['path_prefix'])
+        end
+
+        def open
+          @z = Zlib::Deflate.new
+          @r, @w = IO.pipe
+          @path = sprintf(
+            "#{@task['path_prefix']}#{@task['sequence_format']}#{@task['file_ext']}",
+            Process.pid, Thread.current.object_id
+          )
+          insert_object(path: @path, io: @r)
+          @opened = true
+        end
+
+        def close
+          @w << @z.finish
+          @w.close rescue nil
+          "gs://#{@bucket}/#{@path}"
+        end
+
+        def write(io, formatted_record)
+          io.write @z.deflate(formatted_record)
+        end
+
+        def add(page)
+          open unless @opened
+          _io = @io
+          # I once tried to split IO writing into another IO thread using SizedQueue
+          # However, it resulted in worse performance, so I removed the codes.
+          page.each do |record|
+            Embulk.logger.trace { "embulk-output-bigquery: record #{record}" }
+            formatted_record = @formatter_proc.call(record)
+            Embulk.logger.trace { "embulk-output-bigquery: formatted_record #{formatted_record.chomp}" }
+            write(_io, formatted_record)
+            @num_rows += 1
+          end
+          log_num_rows
+          @num_rows
         end
 
         def client
@@ -53,7 +73,7 @@ module Embulk
 
           scope = "https://www.googleapis.com/auth/cloud-platform"
 
-          case @auth_method
+          case task['auth_method']
           when 'private_key'
             key = Google::APIClient::KeyUtils.load_from_pkcs12(@private_key_path, @private_key_passphrase)
             auth = Signet::OAuth2::Client.new(
@@ -109,7 +129,7 @@ module Embulk
             Embulk.logger.error {
               "embulk-output-bigquery: insert_bucket(#{@project}, #{body}, #{opts}), response:#{response}"
             }
-            raise Error, "failed to create dataset #{@project}:#{dataset}, response:#{response}"
+            raise Error, "failed to create bucket #{@project}:#{dataset}, response:#{response}"
           end
         end
 
@@ -169,86 +189,32 @@ module Embulk
           get_response
         end
 
-        def io
-          return @io if @io
+        def insert_object(bucket: nil, path:, io:)
+          bucket ||= @bucket
+          begin
+            Embulk.logger.info { "embulk-output-bigquery: Create object... #{@project}:gs://#{bucket}/#{path}" }
+            body  = {
+              name: path,
+              upload_source: io,
+              content_type: 'application/gzip', # 'application/json'
+            }
+            opts = {}
 
-          path = sprintf(
-            "#{@task['path_prefix']}#{@task['sequence_format']}#{@task['file_ext']}",
-            Process.pid, Thread.current.object_id
-          )
-          if File.exist?(path)
-            Embulk.logger.warn { "embulk-output-bigquery: unlink already existing #{path}" }
-            File.unlink(path) rescue nil
+            Embulk.logger.debug { "embulk-output-bigquery, insert_object(#{bucket}, #{body}, #{opts})" }
+            client.insert_bucket(bucket, body, opts)
+          rescue Google::Apis::ServerError, Google::Apis::ClientError, Google::Apis::AuthorizationError => e
+            response = {status_code: e.status_code, message: e.message, error_class: e.class}
+            Embulk.logger.error {
+              "embulk-output-bigquery: insert_object(#{bucket}, #{body}, #{opts}), response:#{response}"
+            }
+            raise Error, "failed to create object #{bucket}:#{dataset}, response:#{response}"
           end
-          Embulk.logger.info { "embulk-output-bigquery: create #{path}" }
-
-          @io = open(path, 'w')
         end
 
-        def open(path, mode = 'w')
-          file_io = File.open(path, mode)
-          case @task['compression'].downcase
-          when 'gzip'
-            io = Zlib::GzipWriter.new(file_io)
-          else
-            io = file_io
-          end
-          io
+        def purge_objects(bucket: nil, path_prefix:)
         end
 
-        def close
-          io.close rescue nil
-          io
-        end
 
-        def reopen
-          @io = open(io.path, 'a')
-        end
-
-        def to_payload(record)
-          "#{record[@payload_column_index]}\n"
-        end
-
-        def to_csv(record)
-          record.map.with_index do |value, column_index|
-            @converters[column_index].call(value)
-          end.to_csv
-        end
-
-        def to_jsonl(record)
-          hash = {}
-          column_names = @schema.names
-          record.each_with_index do |value, column_index|
-            column_name = column_names[column_index]
-            hash[column_name] = @converters[column_index].call(value)
-          end
-          "#{hash.to_json}\n"
-        end
-
-        def num_format(number)
-          number.to_s.gsub(/(\d)(?=(\d{3})+(?!\d))/, '\1,')
-        end
-
-        def add(page)
-          _io = io
-          # I once tried to split IO writing into another IO thread using SizedQueue
-          # However, it resulted in worse performance, so I removed the codes.
-          page.each do |record|
-            Embulk.logger.trace { "embulk-output-bigquery: record #{record}" }
-            formatted_record = @formatter_proc.call(record)
-            Embulk.logger.trace { "embulk-output-bigquery: formatted_record #{formatted_record.chomp}" }
-            _io.write formatted_record
-            @num_rows += 1
-          end
-          now = Time.now
-          if @progress_log_timer < now - 10 # once in 10 seconds
-            speed = ((@num_rows - @previous_num_rows) / (now - @progress_log_timer).to_f).round(1)
-            @progress_log_timer = now
-            @previous_num_rows = @num_rows
-            Embulk.logger.info { "embulk-output-bigquery: num_rows #{num_format(@num_rows)} (#{num_format(speed)} rows/sec)" }
-          end
-          @num_rows
-        end
       end
     end
   end

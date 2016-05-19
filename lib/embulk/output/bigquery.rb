@@ -4,6 +4,7 @@ require 'fileutils'
 require 'securerandom'
 require_relative 'bigquery/bigquery_client'
 require_relative 'bigquery/file_writer'
+require_relative 'bigquery/gcs_writer'
 require_relative 'bigquery/value_converter_factory'
 
 module Embulk
@@ -67,6 +68,7 @@ module Embulk
           'application_name'               => config.param('application_name',               :string,  :default => 'Embulk BigQuery plugin'),
           'sdk_log_level'                  => config.param('sdk_log_level',                  :string,  :default => nil),
 
+          'gcs_bucket'                     => config.param('gcs_bucket',                     :string,  :default => nil), # upload to and load from gcs
           'path_prefix'                    => config.param('path_prefix',                    :string,  :default => nil),
           'sequence_format'                => config.param('sequence_format',                :string,  :default => '.%d.%d'),
           'file_ext'                       => config.param('file_ext',                       :string,  :default => nil),
@@ -233,7 +235,7 @@ module Embulk
       end
 
       def self.transaction_report(task, responses)
-        num_input_rows = file_writers.empty? ? 0 : file_writers.map(&:num_rows).inject(:+)
+        num_input_rows = writers.empty? ? 0 : writers.map(&:num_rows).inject(:+)
         num_response_rows = responses.inject(0) do |sum, response|
           sum + (response ? response.statistics.load.output_rows.to_i : 0)
         end
@@ -296,13 +298,7 @@ module Embulk
             paths = Dir.glob(path_pattern)
           else
             task_reports = yield(task) # generates local files
-
-            ios = file_writers.map(&:io)
-            paths = ios.map(&:path)
-            ios.each do |io|
-              Embulk.logger.debug { "close #{io.path}" }
-              io.close rescue nil
-            end
+            writers.each {|writer| writer.close }
           end
 
           if rehearsal_thread
@@ -362,45 +358,53 @@ module Embulk
         return next_config_diff
       end
 
-      @file_writers_mutex = Mutex.new
-      @file_writers = Array.new
+      @writers_mutex = Mutex.new
+      @writers = Array.new
 
-      def self.reset_file_writers
-        @file_writers = Array.new
+      def self.reset_writers
+        @writers = Array.new
       end
 
-      def self.file_writers
-        @file_writers
+      def self.writers
+        @writers
       end
 
-      def self.add_file_writer(file_writer)
-        @file_writers_mutex.synchronize do
-          @file_writers << file_writer
+      def self.add_writer(writer)
+        @writers_mutex.synchronize do
+          @writers << writer
         end
       end
 
-      FILE_WRITER_KEY = :embulk_output_bigquery_file_writer
+      def gcs?
+        !@task['gcs_bucket'].nil?
+      end
 
-      # Create one FileWriter object for one output thread, that is, share among tasks.
+      WRITER_KEY = :embulk_output_bigquery_writer
+
+      # Create one Writer object for one output thread, that is, share among tasks.
       # Close theses shared objects in transaction.
       # This is mainly to suppress (or control by -X max_threads) number of files, which
       # equals to number of concurrency to load in parallel, when number of input tasks is many
       #
-      # #file_writer must be called at only #add because threads in other methods
+      # #writer must be called at only #add because threads in other methods
       # are different (called from non-output threads). Note also that #add method
       # of the same task instance would be called in different output threads
-      def file_writer
-        return Thread.current[FILE_WRITER_KEY] if Thread.current[FILE_WRITER_KEY]
-        file_writer = FileWriter.new(@task, @schema, @index, self.class.converters)
-        self.class.add_file_writer(file_writer)
-        Thread.current[FILE_WRITER_KEY] = file_writer
+      def writer
+        return Thread.current[WRITER_KEY] if Thread.current[WRITER_KEY]
+        if gcs?
+          writer = GcsWriter.new(@task, @schema, @index, self.class.converters)
+        else
+          writer = FileWriter.new(@task, @schema, @index, self.class.converters)
+        end
+        self.class.add_writer(writer)
+        Thread.current[WRITER_KEY] = writer
       end
 
       # instance is created on each task
       def initialize(task, schema, index)
         super
 
-        if task['with_rehearsal'] and @index == 0
+        if task['with_rehearsal'] and @index == 0 and !gcs?
           @rehearsaled = false
         end
       end
@@ -412,9 +416,9 @@ module Embulk
       # called for each page in each task
       def add(page)
         return if task['skip_file_generation']
-        num_rows = file_writer.add(page)
+        num_rows = writer.add(page)
 
-        if task['with_rehearsal'] and @index == 0 and !@rehearsaled
+        if task['with_rehearsal'] and @index == 0 and !@rehearsaled and !gcs?
           if num_rows >= task['rehearsal_counts']
             load_rehearsal
             @rehearsaled = true
@@ -426,11 +430,11 @@ module Embulk
         bigquery = self.class.bigquery
         Embulk.logger.info { "embulk-output-bigquery: Rehearsal started" }
 
-        io = file_writer.close # need to close once for gzip
+        io = writer.close # need to close once for gzip
         rehearsal_path = "#{io.path}.rehearsal"
         Embulk.logger.debug { "embulk_output_bigquery: cp #{io.path} #{rehearsal_path}" }
         FileUtils.cp(io.path, rehearsal_path)
-        file_writer.reopen
+        writer.reopen
 
         self.class.rehearsal_thread = Thread.new do
           begin
